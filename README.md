@@ -1,6 +1,11 @@
 <div align="center">
   <img src="https://github.com/user-attachments/assets/3c9e311d-b2dd-4338-ae5a-6c1d10bacd41" alt="PAIN Logo">
 </div>
+<p align="center">
+  $$\color{yellow}{\large \textsf{Because setting up C++ projects shouldn’t hurt this much!}}$$
+</p>
+
+
 
 <hr>
 
@@ -107,4 +112,6 @@ This project is licensed under the **GPL-3.0 License**.
 
 ---
 
-$\color{#D30000}{\textsf{Built because C++ package management was still stuck in the stone age!}}$
+<p align="center">
+  $\color{#D30000}{\large \textsf{Built with pure, unadulterated hatred for C++ linker errors.}}$
+</p>
