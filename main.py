@@ -6,10 +6,14 @@ import json
 import shutil
 import threading
 import time
+import platform
 from pathlib import Path
+from typing import NoReturn, Optional, Tuple
 
 
 # CONSTANTS
+
+PAIN_VERSION = "2.0"
 
 # ANSI color codes for terminal output
 C_RED = "\033[91m"
@@ -64,24 +68,21 @@ class Throbber:
         self.running = False
         if self.thread is not None:
             self.thread.join()
-            self.thread = None  # Reset so the instance can be safely reused
-        # Clears the line safely using a generous padding of spaces
+            self.thread = None
         sys.stdout.write('\r' + ' ' * 80 + '\r')
         sys.stdout.flush()
 
 
-def fatal(msg: str) -> None:
-    # Print error message and exit the program
+def fatal(msg: str) -> NoReturn:
     print(f"\n{STATUS_FAIL} Error: {msg}\n")
     sys.exit(1)
 
 
-def generate_manifest(root_path: Path, project_name: str) -> bool:
-    # Create vcpkg.json manifest if it doesn't already exist
+def generate_manifest(root_path: Path, project_name: str) -> None:
     manifest_path = root_path / "vcpkg.json"
     if manifest_path.exists():
         print(f"  {STATUS_INFO} vcpkg.json already exists, skipping.")
-        return False
+        return
 
     safe_name = project_name.replace('_', '-').lower()
     manifest = {
@@ -92,56 +93,60 @@ def generate_manifest(root_path: Path, project_name: str) -> bool:
 
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding='utf-8')
     print(f"  {STATUS_INFO} Created vcpkg.json manifest.")
-    return True
 
 
-def generate_presets(root_path: Path) -> bool:
-    # Generate CMakePresets.json to integrate with global vcpkg installation
+def generate_presets(root_path: Path) -> None:
     presets_path = root_path / "CMakePresets.json"
     if presets_path.exists():
         print(f"  {STATUS_INFO} CMakePresets.json already exists, skipping.")
-        return False
+        return
+
+    _, triplet = detect_best_compiler()
+    is_mingw = triplet and "mingw" in triplet
+
+    preset: dict = {
+        "name": "vcpkg",
+        "displayName": "PAIN vcpkg Toolchain",
+        "binaryDir": "${sourceDir}/build",
+        "cacheVariables": {
+            "CMAKE_TOOLCHAIN_FILE": str(
+                GLOBAL_VCPKG_PATH / "scripts" / "buildsystems" / "vcpkg.cmake"
+            ).replace('\\', '/')
+        }
+    }
+
+    # Without an explicit generator on MinGW, CMake defaults to NMake Makefiles
+    # (if it finds any MSVC remnants in the environment) or fails entirely
+    # Bake the correct generator directly into the preset so it is always used
+    if is_mingw:
+        preset["generator"] = "MinGW Makefiles"
 
     presets = {
         "version": 3,
-        "configurePresets": [{
-            "name": "vcpkg",
-            "displayName": "PAIN vcpkg Toolchain",
-            "binaryDir": "${sourceDir}/build",
-            "cacheVariables": {
-                "CMAKE_TOOLCHAIN_FILE": str(
-                    GLOBAL_VCPKG_PATH / "scripts" / "buildsystems" / "vcpkg.cmake"
-                ).replace('\\', '/')
-            }
-        }]
+        "configurePresets": [preset]
     }
 
     presets_path.write_text(json.dumps(presets, indent=2) + "\n", encoding='utf-8')
     print(f"  {STATUS_INFO} Created CMakePresets.json for IDE integration.")
-    return True
 
 
 def inject_hook(cmake_path: Path) -> bool:
-    # Inject PAIN dependency hook into CMakeLists.txt after the project() declaration
     content = cmake_path.read_text(encoding='utf-8')
 
     if PAIN_HOOK_LINE in content:
         print(f"  {STATUS_INFO} PAIN hook already present in CMakeLists.txt, skipping.")
         return False
-
-    # Insert hook after the project() call using a lambda to safely handle newlines.
-    # re.DOTALL allows matching multiline project() declarations.
+    
     new_content, count = re.subn(
-        r'(project\s*\(.*?\))',
+        r'(project\s*\([^)]*\))',
         lambda m: m.group(1) + f'\n\n{PAIN_HOOK_BLOCK}\n',
         content,
-        flags=re.IGNORECASE | re.DOTALL
+        flags=re.IGNORECASE
     )
 
     if count == 0:
         raise RuntimeError("Could not find a 'project()' declaration in CMakeLists.txt.")
 
-    # Guard against multiple project() declarations to avoid injecting the hook more than once
     if count > 1:
         raise RuntimeError("Multiple 'project()' declarations found; cannot safely inject hook.")
 
@@ -151,7 +156,6 @@ def inject_hook(cmake_path: Path) -> bool:
 
 
 def check_tool(name: str, command: list) -> bool:
-    # Check if a required command-line tool is available and executes successfully
     try:
         result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if result.returncode == 0:
@@ -165,53 +169,127 @@ def check_tool(name: str, command: list) -> bool:
         return False
 
 
-def setup_global_paths() -> None:
-    # Configure VCPKG_ROOT environment variable and add vcpkg to PATH
+def detect_best_compiler() -> Tuple[Optional[str], Optional[str]]:
+    arch = platform.machine().lower()
+    is_arm = "arm" in arch or "aarch64" in arch
+    arch_prefix = "arm64" if is_arm else "x64"
+
+    def check(cmd):
+        try:
+            return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        except FileNotFoundError:
+            return False
+
+    if os.name == 'nt':
+        if check(["cl", "/?"]):
+            return "MSVC (cl.exe)", f"{arch_prefix}-windows"
+        if check(["clang++", "--version"]):
+            return "Clang (clang++)", f"{arch_prefix}-windows"
+        if check(["g++", "--version"]):
+            return "MinGW (g++)", f"{arch_prefix}-mingw-dynamic"
+
+    elif sys.platform == "darwin":
+        if check(["clang++", "--version"]):
+            return "AppleClang (clang++)", f"{arch_prefix}-osx"
+        if check(["g++", "--version"]):
+            return "GCC (g++)", f"{arch_prefix}-osx"
+
+    else:
+        if check(["g++", "--version"]):
+            return "GCC (g++)", f"{arch_prefix}-linux"
+        if check(["clang++", "--version"]):
+            return "Clang (clang++)", f"{arch_prefix}-linux"
+
+    return None, None
+
+
+def setup_global_paths(triplet: Optional[str] = None) -> None:
     print(f"\n{STATUS_INFO} Configuring environment variables...")
 
     vcpkg_str = str(GLOBAL_VCPKG_PATH)
 
-    # Initialize with safe defaults to prevent UnboundLocalError if branches ever change
     target_profile = None
     export_lines = None
     source_cmd = None
 
     try:
         if os.name == 'nt':
-            subprocess.run(['setx', 'VCPKG_ROOT', vcpkg_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            print(f"  {STATUS_OK} VCPKG_ROOT environment variable set.")
-            print(f"  {C_YELLOW}Note: Restart your terminal for changes to take effect.{C_RESET}")
+            import winreg
+            def _read_user_env(key: str) -> Optional[str]:
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as reg:
+                        val, _ = winreg.QueryValueEx(reg, key)
+                        return val
+                except FileNotFoundError:
+                    return None
+
+            registry_root = _read_user_env("VCPKG_ROOT")
+            registry_triplet = _read_user_env("VCPKG_DEFAULT_TRIPLET")
+            needs_restart_notice = False
+
+            if registry_root != vcpkg_str:
+                subprocess.run(
+                    ['setx', 'VCPKG_ROOT', vcpkg_str],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+                )
+                print(f"  {STATUS_OK} VCPKG_ROOT environment variable set.")
+                needs_restart_notice = True
+
+            if triplet and registry_triplet != triplet:
+                subprocess.run(
+                    ['setx', 'VCPKG_DEFAULT_TRIPLET', triplet],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+                )
+                subprocess.run(
+                    ['setx', 'VCPKG_DEFAULT_HOST_TRIPLET', triplet],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+                )
+                print(f"  {STATUS_OK} VCPKG_DEFAULT_TRIPLET configured to '{triplet}'.")
+                needs_restart_notice = True
+
+            if needs_restart_notice:
+                print(f"  {C_YELLOW}Note: Restart your terminal for changes to take effect globally.{C_RESET}")
+            else:
+                print(f"  {STATUS_INFO} PAIN environment paths already configured in Windows Registry.")
             return
+
         else:
             shell_path = os.environ.get("SHELL", "")
             shell_name = Path(shell_path).name.lower()
             home = Path.home()
 
+            triplet_exports = ""
+            if triplet:
+                if shell_name == "fish":
+                    triplet_exports = f'set -gx VCPKG_DEFAULT_TRIPLET "{triplet}"\nset -gx VCPKG_DEFAULT_HOST_TRIPLET "{triplet}"\n'
+                elif shell_name in ["tcsh", "csh"]:
+                    triplet_exports = f'setenv VCPKG_DEFAULT_TRIPLET "{triplet}"\nsetenv VCPKG_DEFAULT_HOST_TRIPLET "{triplet}"\n'
+                else:
+                    triplet_exports = f'export VCPKG_DEFAULT_TRIPLET="{triplet}"\nexport VCPKG_DEFAULT_HOST_TRIPLET="{triplet}"\n'
+
             if shell_name == "fish":
                 target_profile = home / ".config" / "fish" / "config.fish"
-                export_lines = f'\n# BEGIN PAIN\nset -gx VCPKG_ROOT "{vcpkg_str}"\nfish_add_path "{vcpkg_str}"\n# END PAIN\n'
+                export_lines = f'\n# BEGIN PAIN\nset -gx VCPKG_ROOT "{vcpkg_str}"\nfish_add_path "{vcpkg_str}"\n{triplet_exports}# END PAIN\n'
                 source_cmd = f"source {target_profile}"
 
             elif shell_name in ["tcsh", "csh"]:
                 target_profile = home / f".{shell_name}rc"
-                export_lines = f'\n# BEGIN PAIN\nsetenv VCPKG_ROOT "{vcpkg_str}"\nsetenv PATH "$VCPKG_ROOT:$PATH"\n# END PAIN\n'
+                export_lines = f'\n# BEGIN PAIN\nsetenv VCPKG_ROOT "{vcpkg_str}"\nsetenv PATH "$VCPKG_ROOT:$PATH"\n{triplet_exports}# END PAIN\n'
                 source_cmd = f"source {target_profile}"
 
             elif shell_name == "zsh":
                 target_profile = home / ".zshrc"
-                export_lines = f'\n# BEGIN PAIN\nexport VCPKG_ROOT="{vcpkg_str}"\nexport PATH="$VCPKG_ROOT:$PATH"\n# END PAIN\n'
+                export_lines = f'\n# BEGIN PAIN\nexport VCPKG_ROOT="{vcpkg_str}"\nexport PATH="$VCPKG_ROOT:$PATH"\n{triplet_exports}# END PAIN\n'
                 source_cmd = f"source {target_profile}"
 
             elif shell_name == "bash":
-                # macOS bash login shells read .bash_profile, not .bashrc
                 target_profile = (home / ".bash_profile") if sys.platform == 'darwin' else (home / ".bashrc")
-                export_lines = f'\n# BEGIN PAIN\nexport VCPKG_ROOT="{vcpkg_str}"\nexport PATH="$VCPKG_ROOT:$PATH"\n# END PAIN\n'
+                export_lines = f'\n# BEGIN PAIN\nexport VCPKG_ROOT="{vcpkg_str}"\nexport PATH="$VCPKG_ROOT:$PATH"\n{triplet_exports}# END PAIN\n'
                 source_cmd = f"source {target_profile}"
 
             else:
-                # Fallback to POSIX .profile
                 target_profile = home / ".profile"
-                export_lines = f'\n# BEGIN PAIN\nexport VCPKG_ROOT="{vcpkg_str}"\nexport PATH="$VCPKG_ROOT:$PATH"\n# END PAIN\n'
+                export_lines = f'\n# BEGIN PAIN\nexport VCPKG_ROOT="{vcpkg_str}"\nexport PATH="$VCPKG_ROOT:$PATH"\n{triplet_exports}# END PAIN\n'
                 source_cmd = f". {target_profile}"
 
             if target_profile is None:
@@ -221,10 +299,14 @@ def setup_global_paths() -> None:
             target_profile.touch(exist_ok=True)
             content = target_profile.read_text(encoding='utf-8')
 
-            # Ensure strict idempotency for the entire block
             if "# BEGIN PAIN" not in content:
                 target_profile.write_text(content + export_lines, encoding='utf-8')
                 print(f"  {STATUS_OK} Added PAIN environment paths to shell profile ({target_profile.name}).")
+                print(f"  {C_YELLOW}Run '{source_cmd}' or restart your terminal.{C_RESET}")
+            elif triplet and "VCPKG_DEFAULT_TRIPLET" not in content:
+                updated_content = content.replace("# END PAIN", f"{triplet_exports}# END PAIN")
+                target_profile.write_text(updated_content, encoding='utf-8')
+                print(f"  {STATUS_OK} Added triplet configuration to existing PAIN block in {target_profile.name}.")
                 print(f"  {C_YELLOW}Run '{source_cmd}' or restart your terminal.{C_RESET}")
             else:
                 print(f"  {STATUS_INFO} PAIN environment paths already configured in {target_profile.name}.")
@@ -233,10 +315,7 @@ def setup_global_paths() -> None:
         print(f"  {STATUS_FAIL} Failed to configure environment variables: {e}")
 
 
-def _extract_cmake_usage_lines(vcpkg_output: str, lib_name: str) -> list[str]:
-    # only captures lines from within the
-    # "provides CMake targets:" usage block, not the entire vcpkg output
-    # This prevents false positives from dependency resolution messages
+def _extract_cmake_usage_lines(vcpkg_output: str, lib_name: str) -> list:
     usage_lines = []
     capturing = False
 
@@ -248,12 +327,10 @@ def _extract_cmake_usage_lines(vcpkg_output: str, lib_name: str) -> list[str]:
         if capturing:
             stripped = line.strip()
 
-            # An empty line signals the end of the usage block
             if not stripped:
                 break
 
             if stripped.startswith("find_package(") or stripped.startswith("target_link_libraries("):
-                # Dynamically replace the placeholder target with ${PROJECT_NAME}
                 if stripped.startswith("target_link_libraries("):
                     stripped = re.sub(
                         r'target_link_libraries\([^ ]+',
@@ -265,10 +342,88 @@ def _extract_cmake_usage_lines(vcpkg_output: str, lib_name: str) -> list[str]:
     return usage_lines
 
 
+# I was running into issues when finally building my test projects so I had to resort to clanker help and
+# this function is what claude gave me. I have kept it exaclty as claude gave me so have fun reading it I guess
+def _synthesize_cmake_hooks_from_config(lib_name: str, triplet: Optional[str]) -> list:
+    """
+    Last-resort fallback for packages that ship no 'usage' file (common with
+    MinGW triplets). Reads the <lib>-config.cmake file directly from the package
+    share directory and synthesises the two CMake lines PAIN needs:
+
+        find_package(<Pkg> CONFIG REQUIRED)
+        target_link_libraries(${PROJECT_NAME} PRIVATE <Pkg>::<Pkg>)
+
+    Strategy:
+      1. Find the package dir under ~/.pain/vcpkg/packages/<lib_name>_<triplet>
+      2. Scan share/<lib_name>/ for a *-config.cmake or *-targets.cmake file
+      3. Extract INTERFACE_LINK_LIBRARIES or add_library(... IMPORTED) target
+         names to determine the canonical CMake target (e.g. fmt::fmt).
+      4. If we can't determine the target, fall back to the conventional
+         <PascalCase>::<PascalCase> target name derived from the lib name,
+         which is correct for the vast majority of vcpkg ports.
+    """
+    packages_dir = GLOBAL_VCPKG_PATH / "packages"
+
+    # Find the package directory — prefer exact triplet match, then any triplet
+    candidates = list(packages_dir.glob(f"{lib_name}_{triplet}")) if triplet else []
+    if not candidates:
+        candidates = list(packages_dir.glob(f"{lib_name}_*"))
+    # Exclude debug-only dirs
+    candidates = [c for c in candidates if c.is_dir() and "debug" not in c.name]
+
+    if not candidates:
+        return []
+
+    share_dir = candidates[0] / "share" / lib_name
+    if not share_dir.is_dir():
+        return []
+
+    # Collect all cmake files in the share dir
+    cmake_files = list(share_dir.glob("*.cmake"))
+    if not cmake_files:
+        return []
+
+    # Try to extract imported target names from the cmake files.
+    # vcpkg targets are declared with add_library(Foo::Bar IMPORTED) or
+    # set_target_properties(Foo::Bar ...) patterns.
+    target_names = []
+    imported_pattern = re.compile(r'add_library\(([A-Za-z0-9_:]+)\s+\w*\s*IMPORTED', re.IGNORECASE)
+    property_pattern = re.compile(r'set_target_properties\(\s*([A-Za-z0-9_:]+)\s+PROPERTIES', re.IGNORECASE)
+
+    for cmake_file in cmake_files:
+        try:
+            text = cmake_file.read_text(encoding='utf-8', errors='ignore')
+            for m in imported_pattern.finditer(text):
+                name = m.group(1)
+                if '::' in name and name not in target_names:
+                    target_names.append(name)
+            if not target_names:
+                for m in property_pattern.finditer(text):
+                    name = m.group(1)
+                    if '::' in name and name not in target_names:
+                        target_names.append(name)
+        except Exception:
+            continue
+
+    if target_names:
+        # Use the first (most likely primary) target for the link line,
+        # but emit find_package based on the namespace prefix (part before ::)
+        primary_target = target_names[0]
+        package_name = primary_target.split("::")[0]
+    else:
+        # Conventional fallback: fmt -> fmt::fmt
+        package_name = lib_name
+        primary_target = f"{lib_name}::{lib_name}"
+
+    return [
+        f"find_package({package_name} CONFIG REQUIRED)",
+        f"target_link_libraries(${{PROJECT_NAME}} PRIVATE {primary_target})",
+    ]
+
+
 # RUNNERS
 
 def run_init(name: str) -> None:
-    # Create a new C++ project with PAIN scaffolding
     if not re.match(r'^[a-zA-Z0-9_-]+$', name) or name.startswith(('-', '.')):
         fatal("Invalid project name. Use only letters, numbers, hyphens, and underscores.")
 
@@ -281,11 +436,10 @@ def run_init(name: str) -> None:
     root.mkdir()
     (root / "src").mkdir()
 
-    # Create main source file
     (root / "src" / "main.cpp").write_text(
         '#include <iostream>\n\n'
         'int main() {\n'
-        '    std::cout << "Hello from PAIN v2.0!\\n";\n'
+        f'    std::cout << "Hello from PAIN v{PAIN_VERSION}!\\n";\n'
         '    return 0;\n'
         '}\n',
         encoding='utf-8'
@@ -301,7 +455,6 @@ def run_init(name: str) -> None:
     )
     (root / "CMakeLists.txt").write_text(cmake_content, encoding='utf-8')
 
-    # Create .gitignore
     (root / ".gitignore").write_text(
         "build/\n"
         "vcpkg_installed/\n"
@@ -319,14 +472,12 @@ def run_init(name: str) -> None:
 
 
 def run_adopt() -> None:
-    # Adopt an existing CMake project and make it PAIN-compatible
     curr = Path.cwd()
     root = None
 
     print(f"\n{STATUS_INFO} Searching for CMakeLists.txt...")
 
-    # Capped search depth to 3 levels up to prevent adopting random root directories
-    search_paths = [curr] + list(curr.parents)[:3]
+    search_paths = [curr] + list(curr.parents)[:2]
     for parent in search_paths:
         if (parent / "CMakeLists.txt").exists():
             root = parent
@@ -341,7 +492,7 @@ def run_adopt() -> None:
     print(f"{STATUS_INFO} Adopting project at: {root}")
 
     cmake_content = (root / "CMakeLists.txt").read_text(encoding='utf-8')
-    match = re.search(r'project\s*\(\s*([a-zA-Z0-9_-]+)', cmake_content, re.IGNORECASE | re.DOTALL)
+    match = re.search(r'project\s*\(\s*([a-zA-Z0-9_-]+)', cmake_content, re.IGNORECASE)
     proj_name = match.group(1) if match else root.name
 
     try:
@@ -352,7 +503,6 @@ def run_adopt() -> None:
     generate_manifest(root, proj_name)
     generate_presets(root)
 
-    # Update .gitignore if it exists
     gitignore = root / ".gitignore"
     if gitignore.exists():
         content = gitignore.read_text(encoding='utf-8')
@@ -363,7 +513,6 @@ def run_adopt() -> None:
 
 
 def run_doctor() -> None:
-    # Perform system diagnostics and install/configure vcpkg if needed
     print(f"\n{STATUS_INFO} Running PAIN System Diagnostics...\n")
 
     tools_ok = True
@@ -374,15 +523,10 @@ def run_doctor() -> None:
     if not check_tool("CMake", ["cmake", "--version"]):
         tools_ok = False
 
-    # Check for C++ compiler — checked separately to avoid printing misleading FAIL
-    # for MSVC when g++/clang++ is already found
-    compiler_ok = False
-    if check_tool("C++ Compiler (g++/clang++)", ["c++", "--version"]):
-        compiler_ok = True
-    elif check_tool("MSVC (cl.exe)", ["cl", "/?"]):
-        compiler_ok = True
-
-    if not compiler_ok:
+    compiler_name, triplet = detect_best_compiler()
+    if compiler_name:
+        print(f"  {STATUS_OK} C++ Compiler ({compiler_name}) is installed and available in PATH.")
+    else:
         print(f"  {STATUS_FAIL} No C++ compiler detected. vcpkg bootstrap may fail.")
         tools_ok = False
 
@@ -395,6 +539,7 @@ def run_doctor() -> None:
 
     if GLOBAL_VCPKG_PATH.exists() and vcpkg_exe.exists():
         print(f"  {STATUS_OK} vcpkg is installed and ready.")
+        setup_global_paths(triplet)
     else:
         print(f"  {STATUS_FAIL} vcpkg installation not found.")
 
@@ -418,24 +563,21 @@ def run_doctor() -> None:
                 subprocess.run([bootstrap_script, "-disableMetrics"], cwd=GLOBAL_VCPKG_PATH, check=True)
 
                 print(f"  {STATUS_OK} vcpkg installed successfully!")
-                setup_global_paths()
+                setup_global_paths(triplet)
 
             except Exception as e:
-                # Clean up any partial installation so doctor can offer a fresh retry next time
                 if GLOBAL_VCPKG_PATH.exists():
                     shutil.rmtree(GLOBAL_VCPKG_PATH, ignore_errors=True)
                 fatal(f"Failed to install vcpkg. Partial installation removed.\nDetails: {e}")
         else:
             print(f"  {STATUS_INFO} vcpkg installation skipped.")
 
-    # Ensure cache directory exists
     (PAIN_DIR / "archives").mkdir(exist_ok=True)
 
     print(f"\n{STATUS_OK} PAIN diagnostics completed.\n")
 
 
 def run_search(query: str) -> None:
-    # Searches the local vcpkg registry for available packages
     print(f"\n{STATUS_INFO} Searching vcpkg registry for '{query}'...\n")
 
     vcpkg_exe = GLOBAL_VCPKG_PATH / ("vcpkg.exe" if os.name == 'nt' else "vcpkg")
@@ -449,7 +591,8 @@ def run_search(query: str) -> None:
         result = subprocess.run(
             [str(vcpkg_exe), "search", query],
             capture_output=True,
-            text=True
+            text=True,
+            cwd=GLOBAL_VCPKG_PATH
         )
         throbber.stop()
     except Exception as e:
@@ -458,11 +601,8 @@ def run_search(query: str) -> None:
 
     if result.returncode != 0:
         if not result.stdout.strip():
-            # No output at all — genuine vcpkg failure
             fatal(f"Search failed. vcpkg encountered an error:\n{result.stderr.strip()}")
         else:
-            # Non-zero exit but there is output — vcpkg may still have returned results
-            # (e.g. "no packages found" message). Fall through and let the output checks handle it.
             print(f"  {STATUS_INFO} vcpkg exited with code {result.returncode}, attempting to parse output anyway.")
 
     output = result.stdout.strip()
@@ -470,6 +610,10 @@ def run_search(query: str) -> None:
     if not output or "No packages match" in output:
         print(f"  {STATUS_FAIL} No libraries found matching '{query}'.")
         return
+
+    term_width = shutil.get_terminal_size((80, 20)).columns
+    name_width = 25
+    max_desc_len = max(10, term_width - name_width - 6)
 
     lines = output.split('\n')
     for line in lines:
@@ -480,16 +624,15 @@ def run_search(query: str) -> None:
         name = parts[0]
         desc = parts[1] if len(parts) > 1 else ""
 
-        if len(desc) > 80:
-            desc = desc[:77] + "..."
+        if len(desc) > max_desc_len:
+            desc = desc[:max_desc_len - 3] + "..."
 
-        print(f"  {C_GREEN}{name.ljust(25)}{C_RESET} {desc}")
+        print(f"  {C_GREEN}{name.ljust(name_width)}{C_RESET} {desc}")
 
     print(f"\n{STATUS_OK} Search complete. Use {C_YELLOW}pain install <lib>{C_RESET} to download.\n")
 
 
 def run_install(lib_name: str) -> None:
-    # Downloads and compiles a library into the global cache
     print(f"\n{STATUS_INFO} Installing '{lib_name}' globally...")
     print(f"  {C_YELLOW}If this is your first time installing this library, it may take a few minutes to download and compile from source.{C_RESET}\n")
 
@@ -498,15 +641,12 @@ def run_install(lib_name: str) -> None:
         fatal("vcpkg is not installed. Run 'pain doctor' first to set up your environment.")
 
     try:
-        # Use check=True so a non-zero vcpkg exit code raises immediately
-        # with a CalledProcessError, rather than silently falling through to the
-        # list-check and producing a misleading "not found in cache" error message
-        subprocess.run([str(vcpkg_exe), "install", lib_name], check=True)
+        subprocess.run([str(vcpkg_exe), "install", lib_name], check=True, cwd=GLOBAL_VCPKG_PATH)
 
-        # Secondary validation: confirm the library actually landed in the installed list.
-        # This catches edge cases where vcpkg exits 0 but emits build warnings without
-        # producing a usable package.
-        list_check = subprocess.run([str(vcpkg_exe), "list", lib_name], capture_output=True, text=True)
+        list_check = subprocess.run(
+            [str(vcpkg_exe), "list", lib_name],
+            capture_output=True, text=True, cwd=GLOBAL_VCPKG_PATH
+        )
         if not _vcpkg_installed_pattern(lib_name).search(list_check.stdout):
             fatal(
                 f"Installation finished, but '{lib_name}' was not found in the global cache. "
@@ -517,17 +657,38 @@ def run_install(lib_name: str) -> None:
         print(f"  {C_YELLOW}Tip: You can now run 'pain add {lib_name}' in any project to link it instantly.{C_RESET}\n")
 
     except subprocess.CalledProcessError:
-        # vcpkg already printed its own error output to the terminal since we didn't
-        # capture stdout/stderr, so just provide a clean summary line.
         fatal(f"vcpkg failed to install '{lib_name}'. Check the output above for details.")
     except SystemExit:
-        raise  # Let fatal()'s sys.exit() propagate normally
+        raise
     except Exception as e:
         fatal(f"Unexpected error while installing '{lib_name}': {e}")
 
 
+def run_uninstall(lib_name: str) -> None:
+    print(f"\n{STATUS_INFO} Uninstalling '{lib_name}' from the global cache...")
+
+    vcpkg_exe = GLOBAL_VCPKG_PATH / ("vcpkg.exe" if os.name == 'nt' else "vcpkg")
+    if not vcpkg_exe.exists():
+        fatal("vcpkg is not installed. Run 'pain doctor' first.")
+
+    try:
+        list_check = subprocess.run(
+            [str(vcpkg_exe), "list", lib_name],
+            capture_output=True, text=True, cwd=GLOBAL_VCPKG_PATH
+        )
+        if not _vcpkg_installed_pattern(lib_name).search(list_check.stdout):
+            print(f"  {STATUS_INFO} '{lib_name}' is not currently installed globally.")
+            return
+
+        subprocess.run([str(vcpkg_exe), "remove", lib_name], check=True, cwd=GLOBAL_VCPKG_PATH)
+        print(f"  {STATUS_OK} Successfully uninstalled '{lib_name}'.")
+    except subprocess.CalledProcessError:
+        fatal(f"Failed to uninstall '{lib_name}'.")
+
+
 def run_add(lib_name: str) -> None:
-    # Links a globally installed library to the current project
+    # Links a globally installed library to the current project.
+    # Requires the library to already be installed globally via 'pain install'.
     curr = Path.cwd()
     manifest_path = curr / "vcpkg.json"
     sidecar_path = curr / ".pain_deps.cmake"
@@ -536,22 +697,27 @@ def run_add(lib_name: str) -> None:
         fatal("You must be inside a PAIN project (with a CMakeLists.txt and vcpkg.json) to run 'add'.")
 
     vcpkg_exe = GLOBAL_VCPKG_PATH / ("vcpkg.exe" if os.name == 'nt' else "vcpkg")
+    if not vcpkg_exe.exists():
+        fatal("vcpkg is not installed. Run 'pain doctor' first.")
+
+    # Verify the library is already installed globally before proceeding
+    list_check = subprocess.run(
+        [str(vcpkg_exe), "list", lib_name],
+        capture_output=True, text=True, cwd=GLOBAL_VCPKG_PATH
+    )
+    if not _vcpkg_installed_pattern(lib_name).search(list_check.stdout):
+        fatal(
+            f"'{lib_name}' is not installed in the global cache. "
+            f"Run 'pain install {lib_name}' first."
+        )
 
     print(f"\n{STATUS_INFO} Linking '{lib_name}' to your project...")
+
     throbber = Throbber("Extracting CMake hooks...")
     throbber.start()
 
     try:
-        # Enforce two-step workflow using strict regex to avoid substring false positives
-        list_check = subprocess.run([str(vcpkg_exe), "list", lib_name], capture_output=True, text=True)
-        if not _vcpkg_installed_pattern(lib_name).search(list_check.stdout):
-            throbber.stop()
-            # Explicit return after fatal() so that if fatal() is ever refactored
-            # to raise instead of exit, execution cannot fall through to the extractor
-            fatal(f"'{lib_name}' is not installed globally yet. Run 'pain install {lib_name}' first.")
-            return
 
-        # Add to vcpkg.json safely
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         added_to_manifest = False
         if lib_name not in manifest.get("dependencies", []):
@@ -559,48 +725,316 @@ def run_add(lib_name: str) -> None:
             manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding='utf-8')
             added_to_manifest = True
 
-        # Retrieve the CMake usage instructions from vcpkg
-        # Running install on an already-installed package completes instantly and
-        # prints the usage block we need to parse
-        result = subprocess.run([str(vcpkg_exe), "install", lib_name], capture_output=True, text=True)
+        # Run vcpkg install to get the usage output. The library is already cached
+        # so this completes instantly — it's used only to capture the usage block.
+        result = subprocess.run(
+            [str(vcpkg_exe), "install", lib_name],
+            capture_output=True, text=True, cwd=GLOBAL_VCPKG_PATH
+        )
+
+        usage_lines = _extract_cmake_usage_lines(result.stdout, lib_name)
+
+        # Fallback chain when vcpkg install output is empty (library already cached).
+        # Level 1: look for a static 'usage' file in the package share directory.
+        
+        # Level 2:  synthesise hooks by parsing the cmake config files directly. 
+        #           This handles MinGW and other triplets that never generate a
+        #           'usage' file but do ship a proper *-config.cmake.
+        if not usage_lines:
+            _, triplet = detect_best_compiler()
+            packages_dir = GLOBAL_VCPKG_PATH / "packages"
+            candidates = list(packages_dir.glob(f"{lib_name}_{triplet}")) if triplet else []
+            if not candidates:
+                candidates = list(packages_dir.glob(f"{lib_name}_*"))
+            candidates = [c for c in candidates if c.is_dir() and "debug" not in c.name]
+
+            # Level 1 - usage file
+            for candidate in candidates:
+                usage_file = candidate / "share" / lib_name / "usage"
+                if usage_file.exists():
+                    usage_lines = _extract_cmake_usage_lines(
+                        usage_file.read_text(encoding='utf-8'), lib_name
+                    )
+                    if usage_lines:
+                        break
+
+        # Level 2 - synthesise from cmake config files
+        if not usage_lines:
+            _, triplet = detect_best_compiler()
+            usage_lines = _synthesize_cmake_hooks_from_config(lib_name, triplet)
+
         throbber.stop()
 
-        if result.returncode != 0:
-            fatal(f"vcpkg install failed while retrieving hooks:\n{result.stderr}")
-            return
+        if usage_lines:
+            sidecar_content = sidecar_path.read_text(encoding='utf-8') if sidecar_path.exists() else ""
+            if usage_lines[0] not in sidecar_content:
+                with sidecar_path.open("a", encoding='utf-8') as f:
+                    f.write(f"\n# Added by PAIN: {lib_name}\n" + "\n".join(usage_lines) + "\n")
+
+            manifest_msg = "added to vcpkg.json" if added_to_manifest else "already in vcpkg.json"
+            print(f"  {STATUS_OK} '{lib_name}' linked ({manifest_msg}).")
+        else:
+            print(f"  {STATUS_INFO} '{lib_name}' linked to manifest, but no CMake hooks were found.")
 
     except Exception as e:
+        # Use a consistent stop path — always call stop() in finally so the
+        # throbber is cleaned up whether we succeed, fail, or hit an exception
         throbber.stop()
         fatal(f"An error occurred while linking {lib_name}:\n{e}")
+
+
+def run_remove(lib_name: str) -> None:
+    curr = Path.cwd()
+    manifest_path = curr / "vcpkg.json"
+    sidecar_path = curr / ".pain_deps.cmake"
+
+    if not manifest_path.exists():
+        fatal("No vcpkg.json found. Are you inside a PAIN project?")
+
+    print(f"\n{STATUS_INFO} Removing '{lib_name}' from project...")
+
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    deps = manifest.get("dependencies", [])
+
+    if lib_name in deps:
+        deps.remove(lib_name)
+        manifest["dependencies"] = deps
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding='utf-8')
+        print(f"  {STATUS_OK} Removed '{lib_name}' from vcpkg.json.")
+    else:
+        print(f"  {STATUS_INFO} '{lib_name}' was not found in vcpkg.json.")
+
+    if sidecar_path.exists():
+        content = sidecar_path.read_text(encoding='utf-8')
+        pattern = re.compile(
+            rf'\n?# Added by PAIN: {re.escape(lib_name)}\n.*?(?=# Added by PAIN: |\Z)',
+            re.DOTALL
+        )
+        new_content, count = pattern.subn('', content)
+
+        if count > 0:
+            new_content = new_content.strip() + "\n" if new_content.strip() else ""
+            sidecar_path.write_text(new_content, encoding='utf-8')
+            print(f"  {STATUS_OK} Sliced CMake hooks for '{lib_name}' from .pain_deps.cmake.")
+        else:
+            print(f"  {STATUS_INFO} No CMake hooks found for '{lib_name}' in the sidecar.")
+
+
+def run_sync() -> None:
+    curr = Path.cwd()
+    manifest_path = curr / "vcpkg.json"
+    sidecar_path = curr / ".pain_deps.cmake"
+
+    if not manifest_path.exists():
+        fatal("No vcpkg.json found. Cannot sync.")
+
+    print(f"\n{STATUS_INFO} Synchronizing dependency sidecar...")
+    vcpkg_exe = GLOBAL_VCPKG_PATH / ("vcpkg.exe" if os.name == 'nt' else "vcpkg")
+    if not vcpkg_exe.exists():
+        fatal("vcpkg is not installed. Run 'pain doctor' first.")
+
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    deps = manifest.get("dependencies", [])
+
+    if sidecar_path.exists():
+        sidecar_path.unlink()
+
+    if not deps:
+        print(f"  {STATUS_OK} No dependencies in manifest. Sidecar cleared.")
         return
 
-    # Scoped regex extractor delegates to a helper that only captures
-    # lines from within the "provides CMake targets:" usage block, preventing false
-    # positives from dependency resolution messages elsewhere in the output
-    usage_lines = _extract_cmake_usage_lines(result.stdout, lib_name)
+    throbber = Throbber("Regenerating CMake hooks from manifest...")
+    throbber.start()
 
-    # Inject into the .pain_deps.cmake sidecar
-    sidecar_content = sidecar_path.read_text(encoding='utf-8') if sidecar_path.exists() else ""
-    hooks_already_present = usage_lines and usage_lines[0] in sidecar_content
+    success_count = 0
+    failures = []
 
-    if usage_lines and not hooks_already_present:
-        new_code = f"\n# Added by PAIN: {lib_name}\n" + "\n".join(usage_lines) + "\n"
-        with sidecar_path.open("a", encoding='utf-8') as f:
-            f.write(new_code)
+    # Wrap the entire loop in try/finally so the throbber is always stopped
+    try:
+        for lib in deps:
+            result = subprocess.run(
+                [str(vcpkg_exe), "install", lib],
+                capture_output=True, text=True, cwd=GLOBAL_VCPKG_PATH
+            )
+            if result.returncode == 0:
+                usage_lines = _extract_cmake_usage_lines(result.stdout, lib)
+                if usage_lines:
+                    new_code = f"\n# Added by PAIN: {lib}\n" + "\n".join(usage_lines) + "\n"
+                    with sidecar_path.open("a", encoding='utf-8') as f:
+                        f.write(new_code)
+                success_count += 1
+            else:
+                failures.append(lib)
+    finally:
+        throbber.stop()
 
-    # Always print a clear summary of what was done, even for header-only
-    # libraries that produce no CMake hooks, so the command never looks like a no-op
-    manifest_msg = f"added to vcpkg.json" if added_to_manifest else "already in vcpkg.json"
+    for lib in failures:
+        print(f"  {STATUS_FAIL} Failed to retrieve hooks for '{lib}', skipping.")
+    print(f"  {STATUS_OK} Sync complete! Restored hooks for {success_count} of {len(deps)} libraries.")
 
-    if not usage_lines:
-        print(f"  {STATUS_OK} '{lib_name}' linked ({manifest_msg}).")
-        print(f"  {STATUS_INFO} No CMake hooks needed — this appears to be a header-only library.")
-    elif hooks_already_present:
-        print(f"  {STATUS_OK} '{lib_name}' linked ({manifest_msg}).")
-        print(f"  {STATUS_INFO} CMake hooks already present in .pain_deps.cmake.")
+
+def run_list() -> None:
+    curr = Path.cwd()
+    manifest_path = curr / "vcpkg.json"
+
+    if manifest_path.exists():
+        print(f"\n{STATUS_INFO} Local Project Dependencies (vcpkg.json):")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            deps = manifest.get("dependencies", [])
+            if deps:
+                for d in deps:
+                    print(f"  {C_GREEN}- {d}{C_RESET}")
+                sidecar = curr / ".pain_deps.cmake"
+                if sidecar.exists():
+                    print(f"  {STATUS_INFO} CMake hooks: {sidecar}")
+            else:
+                print("  (None)")
+        except json.JSONDecodeError:
+            fatal("Failed to parse vcpkg.json. File may be corrupted.")
     else:
-        print(f"  {STATUS_OK} '{lib_name}' linked ({manifest_msg}).")
-        print(f"  {STATUS_OK} CMake hooks written to .pain_deps.cmake.")
+        print(f"\n{STATUS_INFO} Global Cache Packages (~/.pain/vcpkg/packages):")
+        vcpkg_exe = GLOBAL_VCPKG_PATH / ("vcpkg.exe" if os.name == 'nt' else "vcpkg")
+        if not vcpkg_exe.exists():
+            fatal("vcpkg is not installed. Run 'pain doctor' first.")
+
+        try:
+            subprocess.run([str(vcpkg_exe), "list"], check=True, cwd=GLOBAL_VCPKG_PATH)
+        except subprocess.CalledProcessError:
+            fatal("Failed to list global packages. vcpkg encountered an error.")
+
+
+def run_build(args: list) -> None:
+    config = args[0] if len(args) > 0 else "Debug"
+    curr = Path.cwd()
+
+    if not (curr / "CMakeLists.txt").exists():
+        fatal("No CMakeLists.txt found. You must be in the project root to build.")
+
+    print(f"\n{STATUS_INFO} Configuring CMake (Config: {config})...")
+
+    _, triplet = detect_best_compiler()
+    is_mingw = triplet and "mingw" in triplet
+
+    preset_path = curr / "CMakePresets.json"
+    if preset_path.exists():
+        cfg_cmd = ["cmake", "--preset", "vcpkg"]
+        if triplet:
+            cfg_cmd.append(f"-DVCPKG_TARGET_TRIPLET={triplet}")
+        # On MinGW, force the generator even when using a preset — if the preset
+        # doesn't already declare one, CMake may fall back to NMake Makefiles
+        # when MSVC environment remnants are present, causing a hard failure.
+        if is_mingw:
+            cfg_cmd.extend(["-G", "MinGW Makefiles"])
+    else:
+        cfg_cmd = ["cmake", "-B", "build", "-S", "."]
+        if triplet:
+            cfg_cmd.append(f"-DVCPKG_TARGET_TRIPLET={triplet}")
+        # Only inject the generator flag for the fallback (non-preset) path
+        if is_mingw:
+            cfg_cmd.extend(["-G", "MinGW Makefiles"])
+
+    cfg_result = subprocess.run(cfg_cmd)
+    if cfg_result.returncode != 0:
+        fatal("CMake configuration failed. Check the output above for errors.")
+
+    print(f"\n{STATUS_INFO} Compiling project...")
+    build_cmd = ["cmake", "--build", "build", "--config", config]
+    build_result = subprocess.run(build_cmd)
+
+    if build_result.returncode == 0:
+        print(f"\n{STATUS_OK} Build completed successfully!")
+    else:
+        fatal("Compilation failed. Check the output above for errors.")
+
+
+def run_run(args: list) -> None:
+    curr = Path.cwd()
+    build_dir = curr / "build"
+
+    if not build_dir.exists():
+        fatal("Build directory not found. Run 'pain build' first.")
+
+    print(f"\n{STATUS_INFO} Hunting for executable...")
+
+    # On non-Windows, check the executable bit (os.X_OK) instead of just
+    # p.is_file(), which was matching .so files, Makefiles, CMake scripts etc
+    if os.name == 'nt':
+        exes = [
+            p for p in build_dir.rglob("*.exe")
+            if p.is_file()
+            and "vcpkg_installed" not in p.parts
+            and "CMakeFiles" not in p.parts
+        ]
+    else:
+        exes = [
+            p for p in build_dir.rglob("*")
+            if p.is_file()
+            and os.access(p, os.X_OK)
+            and "vcpkg_installed" not in p.parts
+            and "CMakeFiles" not in p.parts
+        ]
+
+    if not exes:
+        fatal("No executable found. Did the build succeed?")
+
+    # Sort by modification time descending so the most recently built
+    # binary is selected, avoiding stale or wrong binaries in multi-target projects
+    exes.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    target_exe = exes[0]
+
+    # Refine selection: prefer the binary whose name matches the project name
+    cmake_file = curr / "CMakeLists.txt"
+    if cmake_file.exists():
+        match = re.search(
+            r'project\s*\(\s*([a-zA-Z0-9_-]+)',
+            cmake_file.read_text(encoding='utf-8'),
+            re.IGNORECASE
+        )
+        if match:
+            proj_name = match.group(1)
+            for e in exes:
+                if e.stem == proj_name:
+                    target_exe = e
+                    break
+
+    print(f"  {STATUS_OK} Executing: {target_exe.relative_to(curr)}")
+    print(f"  {C_YELLOW}{'-'*50}{C_RESET}\n")
+
+    env = os.environ.copy()
+    if os.name == 'nt':
+        paths = [str(p) for p in curr.rglob("bin") if p.is_dir()]
+        compiler_exe = shutil.which("g++") or shutil.which("gcc")
+        if compiler_exe:
+            paths.append(str(Path(compiler_exe).parent))
+        env["PATH"] = os.pathsep.join(set(paths)) + os.pathsep + env.get("PATH", "")
+
+    try:
+
+        if args and args[0] == "--":
+            forwarded = args[1:]
+        else:
+            forwarded = args
+
+        result = subprocess.run([str(target_exe)] + forwarded, env=env)
+
+        if result.returncode != 0:
+            print(f"\n  {C_RED}[Process exited with code {result.returncode}]{C_RESET}")
+
+    except Exception as e:
+        fatal(f"Failed to execute binary: {e}")
+
+    print(f"\n  {C_YELLOW}{'-'*50}{C_RESET}")
+
+
+def run_clean() -> None:
+    build_dir = Path.cwd() / "build"
+    if build_dir.exists():
+        print(f"\n{STATUS_INFO} Cleaning build directory...")
+        shutil.rmtree(build_dir, ignore_errors=True)
+        print(f"  {STATUS_OK} Build folder successfully removed.")
+    else:
+        print(f"\n{STATUS_INFO} Build directory does not exist. Nothing to clean.")
 
 
 # UI
@@ -639,8 +1073,9 @@ def print_help() -> None:
 
     print(f"{C_RED}DEPENDENCIES{C_RESET}")
     print(f"  {C_YELLOW}install{C_RESET} <lib>   Download and compile a library globally")
+    print(f"  {C_YELLOW}uninstall{C_RESET} <lib> Permanently delete a library from global cache")
     print(f"  {C_YELLOW}add{C_RESET} <lib>       Link an installed library to your project")
-    print(f"  {C_YELLOW}remove{C_RESET} <lib>    Remove a library")
+    print(f"  {C_YELLOW}remove{C_RESET} <lib>    Remove a library from your project")
     print(f"  {C_YELLOW}search{C_RESET} <lib>    Search available packages")
     print(f"  {C_YELLOW}list{C_RESET}            List installed dependencies")
     print(f"  {C_YELLOW}sync{C_RESET}            Regenerate dependency links\n")
@@ -655,22 +1090,30 @@ def print_help() -> None:
 
 
 def dashboard() -> None:
-    # Show welcome dashboard when no command is provided
     print_logo()
     print(f"  Type {C_YELLOW}pain help{C_RESET} to see all available commands.\n")
     print(f"  {C_TERRACOTTA}Quick Start:{C_RESET} Run {C_YELLOW}pain init <project_name>{C_RESET} to get started.\n")
 
 
 if __name__ == "__main__":
+    _, runtime_triplet = detect_best_compiler()
+    if runtime_triplet and "VCPKG_DEFAULT_TRIPLET" not in os.environ:
+        os.environ["VCPKG_DEFAULT_TRIPLET"] = runtime_triplet
+        os.environ["VCPKG_DEFAULT_HOST_TRIPLET"] = runtime_triplet
+
+    if "VCPKG_ROOT" not in os.environ:
+        os.environ["VCPKG_ROOT"] = str(GLOBAL_VCPKG_PATH)
 
     if len(sys.argv) < 2:
         dashboard()
     else:
-
         cmd = sys.argv[1].lower()
 
         if cmd in ["help", "-help", "--help", "-h"]:
             print_help()
+
+        elif cmd in ["version", "-v", "--version", "-version"]:
+            print(f"{C_RED}PAIN v{PAIN_VERSION}{C_RESET}")
 
         elif cmd == "init":
             if len(sys.argv) < 3:
@@ -693,13 +1136,35 @@ if __name__ == "__main__":
                 fatal("Please provide a library to install. Example: pain install fmt")
             run_install(sys.argv[2])
 
+        elif cmd == "uninstall":
+            if len(sys.argv) < 3:
+                fatal("Please provide a library to uninstall. Example: pain uninstall fmt")
+            run_uninstall(sys.argv[2])
+
         elif cmd == "add":
             if len(sys.argv) < 3:
                 fatal("Please provide a library to add. Example: pain add fmt")
             run_add(sys.argv[2])
 
-        elif cmd in ["remove", "list", "sync", "build", "run", "clean"]:
-            print(f"\n{STATUS_INFO} Command '{cmd}' is not available in this version.\n")
+        elif cmd == "remove":
+            if len(sys.argv) < 3:
+                fatal("Please provide a library to remove. Example: pain remove fmt")
+            run_remove(sys.argv[2])
+
+        elif cmd == "sync":
+            run_sync()
+
+        elif cmd == "list":
+            run_list()
+
+        elif cmd == "build":
+            run_build(sys.argv[2:])
+
+        elif cmd == "run":
+            run_run(sys.argv[2:])
+
+        elif cmd == "clean":
+            run_clean()
 
         else:
             print(f"\n{C_RED}Unknown command: '{cmd}'{C_RESET}")
