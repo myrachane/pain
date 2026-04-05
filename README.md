@@ -19,19 +19,19 @@
 
 <div align="center">
   <a href="https://github.com/omnimistic/pain/releases/latest">
-    <img alt="Latest release" src="https://img.shields.io/github/v/release/omnimistic/pain?style=for-the-badge&color=C9CBFF&logoColor=D9E0EE&labelColor=302D41&include_prerelease&sort=semver" />
+    <img alt="Latest release" src="https://img.shields.io/github/v/release/omnimistic/pain?style=for-the-badge&color=C9CBFF&logoColor=D9E0EE&labelColor=302D41&label=PAIN&include_prerelease&sort=semver" />
   </a>
   <a href="https://github.com/omnimistic/pain/pulse">
     <img alt="Last commit" src="https://img.shields.io/github/last-commit/omnimistic/pain?style=for-the-badge&color=8bd5ca&logoColor=D9E0EE&labelColor=302D41"/>
   </a>
-  <a href="https://python.org">
-    <img alt="Python" src="https://img.shields.io/badge/Python-3.8+-blue?style=for-the-badge&color=c69ff5&logoColor=D9E0EE&labelColor=302D41" />
-  </a>
   <a href="https://github.com/omnimistic/pain/blob/main/LICENSE">
     <img alt="License" src="https://img.shields.io/github/license/omnimistic/pain?style=for-the-badge&color=ee999f&logoColor=D9E0EE&labelColor=302D41" />
   </a>
-  <a href="https://github.com/omnimistic/pain/issues">
-    <img alt="Issues" src="https://img.shields.io/github/issues/omnimistic/pain?style=for-the-badge&color=F5E0DC&logoColor=D9E0EE&labelColor=302D41" />
+  <a href="https://python.org">
+    <img alt="Python" src="https://img.shields.io/badge/Python-3.8+-blue?style=for-the-badge&color=c69ff5&logoColor=D9E0EE&labelColor=302D41" />
+  </a>
+  <a href="https://github.com/omnimistic/pain/stargazers">
+    <img alt="Stars" src="https://img.shields.io/github/stars/omnimistic/pain?style=for-the-badge&color=f9e2af&logoColor=D9E0EE&labelColor=302D41" />
   </a>
 </div>
 
