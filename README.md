@@ -5,8 +5,6 @@
   $$\color{yellow}{\large \textsf{Because setting up C++ projects shouldn’t hurt this much!}}$$
 </p>
 
-
-
 <hr>
 
 <h4 align="center">
@@ -24,8 +22,8 @@
   <a href="https://github.com/omnimistic/pain/pulse">
     <img alt="Last commit" src="https://img.shields.io/github/last-commit/omnimistic/pain?style=for-the-badge&color=8bd5ca&logoColor=D9E0EE&labelColor=302D41"/>
   </a>
-  <a href="https://github.com/omnimistic/pain/blob/main/LICENSE">
-    <img alt="License" src="https://img.shields.io/github/license/omnimistic/pain?style=for-the-badge&color=ee999f&logoColor=D9E0EE&labelColor=302D41" />
+  <a href="https://github.com/omnimistic/pain/blob/master/LICENSE">
+    <img alt="License" src="https://img.shields.io/badge/License-GPLv3-ee999f?style=for-the-badge&logoColor=D9E0EE&labelColor=302D41" />
   </a>
   <a href="https://python.org">
     <img alt="Python" src="https://img.shields.io/badge/Python-3.8+-blue?style=for-the-badge&color=c69ff5&logoColor=D9E0EE&labelColor=302D41" />
@@ -35,9 +33,32 @@
   </a>
 </div>
 
-**PAIN** is a zero-configuration C++ scaffolding engine and dependency auto-linker powered by `vcpkg`.
+Here’s a clean, professional, and humble combined version that keeps your tone but tightens the message:
 
-Rather than forcing you to choose between spending hours writing CMake scripts or battling global environment variables, PAIN offers the best of both worlds — the portability of a standard CMake build, along with the convenience of automated, surgical dependency injection.
+---
+
+**PAIN** — *project manager for C++*
+
+PAIN is a zero-configuration C++ project manager designed to simplify modern C++ development. It combines instant project scaffolding with seamless dependency management, powered by **vcpkg** and modern CMake.
+
+With PAIN, you can create clean C++20 projects, add libraries, and build your code in seconds — without dealing with complex setup or manual configuration.
+
+* `pain init my_app` -> scafolds a project
+* `pain add raylib` -> links raylib to ur project 
+* `pain build` -> build the project
+* `pain run` -> run the build
+
+as simple as that!
+
+PAIN handles vcpkg setup, integration, and linking behind the scenes while still generating clean, portable CMake projects — so you stay in control without the usual friction.
+
+No more linker errors.
+No more environment issues.
+
+Just focus on writing code.
+
+*Because setting up C++ projects shouldn’t hurt this much.*
+
 
 > [!CAUTION]
 > **Built because C++ package management was still stuck in the stone age.**
