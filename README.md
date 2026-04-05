@@ -33,8 +33,6 @@
   </a>
 </div>
 
-Here’s a clean, professional, and humble combined version that keeps your tone but tightens the message:
-
 ---
 
 **PAIN** — *project manager for C++*
