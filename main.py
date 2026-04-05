@@ -27,6 +27,14 @@ STATUS_INFO = f"{C_TERRACOTTA}[INFO]{C_RESET}"
 PAIN_DIR = Path.home() / ".pain"
 GLOBAL_VCPKG_PATH = PAIN_DIR / "vcpkg"
 
+# Single source of truth for the PAIN hook line
+PAIN_HOOK_LINE = "include(.pain_deps.cmake OPTIONAL)"
+PAIN_HOOK_BLOCK = f"# --- PAIN Auto-Linker Hook ---\n{PAIN_HOOK_LINE}"
+
+# Regex for verifying a package is installed (handles triplet suffixes like fmt:x64-linux)
+def _vcpkg_installed_pattern(lib_name: str) -> re.Pattern:
+    return re.compile(rf'^{re.escape(lib_name)}(?::[\w-]+)?\s+', re.MULTILINE)
+
 
 # HELPER FUNCTIONS
 
@@ -116,9 +124,8 @@ def generate_presets(root_path: Path) -> bool:
 def inject_hook(cmake_path: Path) -> bool:
     # Inject PAIN dependency hook into CMakeLists.txt after the project() declaration
     content = cmake_path.read_text(encoding='utf-8')
-    hook = "include(.pain_deps.cmake OPTIONAL)"
 
-    if hook in content:
+    if PAIN_HOOK_LINE in content:
         print(f"  {STATUS_INFO} PAIN hook already present in CMakeLists.txt, skipping.")
         return False
 
@@ -126,7 +133,7 @@ def inject_hook(cmake_path: Path) -> bool:
     # re.DOTALL allows matching multiline project() declarations.
     new_content, count = re.subn(
         r'(project\s*\(.*?\))',
-        lambda m: m.group(1) + f'\n\n# --- PAIN Auto-Linker Hook ---\n{hook}\n',
+        lambda m: m.group(1) + f'\n\n{PAIN_HOOK_BLOCK}\n',
         content,
         flags=re.IGNORECASE | re.DOTALL
     )
@@ -144,11 +151,15 @@ def inject_hook(cmake_path: Path) -> bool:
 
 
 def check_tool(name: str, command: list) -> bool:
-    # Check if a required command-line tool is available
+    # Check if a required command-line tool is available and executes successfully
     try:
-        subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"  {STATUS_OK} {name} is installed and available in PATH.")
-        return True
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode == 0:
+            print(f"  {STATUS_OK} {name} is installed and available in PATH.")
+            return True
+        else:
+            print(f"  {STATUS_FAIL} {name} returned a non-zero exit code.")
+            return False
     except FileNotFoundError:
         print(f"  {STATUS_FAIL} {name} is missing or not in PATH.")
         return False
@@ -178,29 +189,29 @@ def setup_global_paths() -> None:
 
             if shell_name == "fish":
                 target_profile = home / ".config" / "fish" / "config.fish"
-                export_lines = f'\n# PAIN - Global vcpkg configuration\nset -gx VCPKG_ROOT "{vcpkg_str}"\nfish_add_path "{vcpkg_str}"\n'
+                export_lines = f'\n# BEGIN PAIN\nset -gx VCPKG_ROOT "{vcpkg_str}"\nfish_add_path "{vcpkg_str}"\n# END PAIN\n'
                 source_cmd = f"source {target_profile}"
 
             elif shell_name in ["tcsh", "csh"]:
                 target_profile = home / f".{shell_name}rc"
-                export_lines = f'\n# PAIN - Global vcpkg configuration\nsetenv VCPKG_ROOT "{vcpkg_str}"\nsetenv PATH "$VCPKG_ROOT:$PATH"\n'
+                export_lines = f'\n# BEGIN PAIN\nsetenv VCPKG_ROOT "{vcpkg_str}"\nsetenv PATH "$VCPKG_ROOT:$PATH"\n# END PAIN\n'
                 source_cmd = f"source {target_profile}"
 
             elif shell_name == "zsh":
                 target_profile = home / ".zshrc"
-                export_lines = f'\n# PAIN - Global vcpkg configuration\nexport VCPKG_ROOT="{vcpkg_str}"\nexport PATH="$VCPKG_ROOT:$PATH"\n'
+                export_lines = f'\n# BEGIN PAIN\nexport VCPKG_ROOT="{vcpkg_str}"\nexport PATH="$VCPKG_ROOT:$PATH"\n# END PAIN\n'
                 source_cmd = f"source {target_profile}"
 
             elif shell_name == "bash":
                 # macOS bash login shells read .bash_profile, not .bashrc
                 target_profile = (home / ".bash_profile") if sys.platform == 'darwin' else (home / ".bashrc")
-                export_lines = f'\n# PAIN - Global vcpkg configuration\nexport VCPKG_ROOT="{vcpkg_str}"\nexport PATH="$VCPKG_ROOT:$PATH"\n'
+                export_lines = f'\n# BEGIN PAIN\nexport VCPKG_ROOT="{vcpkg_str}"\nexport PATH="$VCPKG_ROOT:$PATH"\n# END PAIN\n'
                 source_cmd = f"source {target_profile}"
 
             else:
                 # Fallback to POSIX .profile
                 target_profile = home / ".profile"
-                export_lines = f'\n# PAIN - Global vcpkg configuration\nexport VCPKG_ROOT="{vcpkg_str}"\nexport PATH="$VCPKG_ROOT:$PATH"\n'
+                export_lines = f'\n# BEGIN PAIN\nexport VCPKG_ROOT="{vcpkg_str}"\nexport PATH="$VCPKG_ROOT:$PATH"\n# END PAIN\n'
                 source_cmd = f". {target_profile}"
 
             if target_profile is None:
@@ -210,15 +221,48 @@ def setup_global_paths() -> None:
             target_profile.touch(exist_ok=True)
             content = target_profile.read_text(encoding='utf-8')
 
-            if "VCPKG_ROOT" not in content:
+            # Ensure strict idempotency for the entire block
+            if "# BEGIN PAIN" not in content:
                 target_profile.write_text(content + export_lines, encoding='utf-8')
-                print(f"  {STATUS_OK} Added VCPKG_ROOT to shell profile ({target_profile.name}).")
+                print(f"  {STATUS_OK} Added PAIN environment paths to shell profile ({target_profile.name}).")
                 print(f"  {C_YELLOW}Run '{source_cmd}' or restart your terminal.{C_RESET}")
             else:
-                print(f"  {STATUS_INFO} VCPKG_ROOT already configured in {target_profile.name}.")
+                print(f"  {STATUS_INFO} PAIN environment paths already configured in {target_profile.name}.")
 
     except Exception as e:
         print(f"  {STATUS_FAIL} Failed to configure environment variables: {e}")
+
+
+def _extract_cmake_usage_lines(vcpkg_output: str, lib_name: str) -> list[str]:
+    # only captures lines from within the
+    # "provides CMake targets:" usage block, not the entire vcpkg output
+    # This prevents false positives from dependency resolution messages
+    usage_lines = []
+    capturing = False
+
+    for line in vcpkg_output.split('\n'):
+        if "provides CMake targets:" in line:
+            capturing = True
+            continue
+
+        if capturing:
+            stripped = line.strip()
+
+            # An empty line signals the end of the usage block
+            if not stripped:
+                break
+
+            if stripped.startswith("find_package(") or stripped.startswith("target_link_libraries("):
+                # Dynamically replace the placeholder target with ${PROJECT_NAME}
+                if stripped.startswith("target_link_libraries("):
+                    stripped = re.sub(
+                        r'target_link_libraries\([^ ]+',
+                        'target_link_libraries(${PROJECT_NAME}',
+                        stripped
+                    )
+                usage_lines.append(stripped)
+
+    return usage_lines
 
 
 # RUNNERS
@@ -247,15 +291,13 @@ def run_init(name: str) -> None:
         encoding='utf-8'
     )
 
-    # Create CMakeLists.txt
     cmake_content = (
         "cmake_minimum_required(VERSION 3.21)\n\n"
         f"project({name})\n\n"
         "set(CMAKE_CXX_STANDARD 20)\n"
         "set(CMAKE_CXX_STANDARD_REQUIRED ON)\n\n"
         f"add_executable({name} src/main.cpp)\n\n"
-        "# --- PAIN Auto-Linker Hook ---\n"
-        "include(.pain_deps.cmake OPTIONAL)\n"
+        f"{PAIN_HOOK_BLOCK}\n"
     )
     (root / "CMakeLists.txt").write_text(cmake_content, encoding='utf-8')
 
@@ -409,15 +451,17 @@ def run_search(query: str) -> None:
             capture_output=True,
             text=True
         )
-    finally:
         throbber.stop()
+    except Exception as e:
+        throbber.stop()
+        fatal(f"Search failed during execution:\n{e}")
 
     if result.returncode != 0:
         if not result.stdout.strip():
-            # No output at all ie genuine vcpkg failure
+            # No output at all — genuine vcpkg failure
             fatal(f"Search failed. vcpkg encountered an error:\n{result.stderr.strip()}")
         else:
-            # Non-zero exit but there is output then vcpkg may still have returned results
+            # Non-zero exit but there is output — vcpkg may still have returned results
             # (e.g. "no packages found" message). Fall through and let the output checks handle it.
             print(f"  {STATUS_INFO} vcpkg exited with code {result.returncode}, attempting to parse output anyway.")
 
@@ -441,7 +485,122 @@ def run_search(query: str) -> None:
 
         print(f"  {C_GREEN}{name.ljust(25)}{C_RESET} {desc}")
 
-    print(f"\n{STATUS_OK} Search complete. Use {C_YELLOW}pain add <lib>{C_RESET} to install.\n")
+    print(f"\n{STATUS_OK} Search complete. Use {C_YELLOW}pain install <lib>{C_RESET} to download.\n")
+
+
+def run_install(lib_name: str) -> None:
+    # Downloads and compiles a library into the global cache
+    print(f"\n{STATUS_INFO} Installing '{lib_name}' globally...")
+    print(f"  {C_YELLOW}If this is your first time installing this library, it may take a few minutes to download and compile from source.{C_RESET}\n")
+
+    vcpkg_exe = GLOBAL_VCPKG_PATH / ("vcpkg.exe" if os.name == 'nt' else "vcpkg")
+    if not vcpkg_exe.exists():
+        fatal("vcpkg is not installed. Run 'pain doctor' first to set up your environment.")
+
+    try:
+        # Use check=True so a non-zero vcpkg exit code raises immediately
+        # with a CalledProcessError, rather than silently falling through to the
+        # list-check and producing a misleading "not found in cache" error message
+        subprocess.run([str(vcpkg_exe), "install", lib_name], check=True)
+
+        # Secondary validation: confirm the library actually landed in the installed list.
+        # This catches edge cases where vcpkg exits 0 but emits build warnings without
+        # producing a usable package.
+        list_check = subprocess.run([str(vcpkg_exe), "list", lib_name], capture_output=True, text=True)
+        if not _vcpkg_installed_pattern(lib_name).search(list_check.stdout):
+            fatal(
+                f"Installation finished, but '{lib_name}' was not found in the global cache. "
+                f"Check the output above for build errors."
+            )
+
+        print(f"\n{STATUS_OK} Successfully installed '{lib_name}' to the global cache.")
+        print(f"  {C_YELLOW}Tip: You can now run 'pain add {lib_name}' in any project to link it instantly.{C_RESET}\n")
+
+    except subprocess.CalledProcessError:
+        # vcpkg already printed its own error output to the terminal since we didn't
+        # capture stdout/stderr, so just provide a clean summary line.
+        fatal(f"vcpkg failed to install '{lib_name}'. Check the output above for details.")
+    except SystemExit:
+        raise  # Let fatal()'s sys.exit() propagate normally
+    except Exception as e:
+        fatal(f"Unexpected error while installing '{lib_name}': {e}")
+
+
+def run_add(lib_name: str) -> None:
+    # Links a globally installed library to the current project
+    curr = Path.cwd()
+    manifest_path = curr / "vcpkg.json"
+    sidecar_path = curr / ".pain_deps.cmake"
+
+    if not (curr / "CMakeLists.txt").exists() or not manifest_path.exists():
+        fatal("You must be inside a PAIN project (with a CMakeLists.txt and vcpkg.json) to run 'add'.")
+
+    vcpkg_exe = GLOBAL_VCPKG_PATH / ("vcpkg.exe" if os.name == 'nt' else "vcpkg")
+
+    print(f"\n{STATUS_INFO} Linking '{lib_name}' to your project...")
+    throbber = Throbber("Extracting CMake hooks...")
+    throbber.start()
+
+    try:
+        # Enforce two-step workflow using strict regex to avoid substring false positives
+        list_check = subprocess.run([str(vcpkg_exe), "list", lib_name], capture_output=True, text=True)
+        if not _vcpkg_installed_pattern(lib_name).search(list_check.stdout):
+            throbber.stop()
+            # Explicit return after fatal() so that if fatal() is ever refactored
+            # to raise instead of exit, execution cannot fall through to the extractor
+            fatal(f"'{lib_name}' is not installed globally yet. Run 'pain install {lib_name}' first.")
+            return
+
+        # Add to vcpkg.json safely
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        added_to_manifest = False
+        if lib_name not in manifest.get("dependencies", []):
+            manifest.setdefault("dependencies", []).append(lib_name)
+            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding='utf-8')
+            added_to_manifest = True
+
+        # Retrieve the CMake usage instructions from vcpkg
+        # Running install on an already-installed package completes instantly and
+        # prints the usage block we need to parse
+        result = subprocess.run([str(vcpkg_exe), "install", lib_name], capture_output=True, text=True)
+        throbber.stop()
+
+        if result.returncode != 0:
+            fatal(f"vcpkg install failed while retrieving hooks:\n{result.stderr}")
+            return
+
+    except Exception as e:
+        throbber.stop()
+        fatal(f"An error occurred while linking {lib_name}:\n{e}")
+        return
+
+    # Scoped regex extractor delegates to a helper that only captures
+    # lines from within the "provides CMake targets:" usage block, preventing false
+    # positives from dependency resolution messages elsewhere in the output
+    usage_lines = _extract_cmake_usage_lines(result.stdout, lib_name)
+
+    # Inject into the .pain_deps.cmake sidecar
+    sidecar_content = sidecar_path.read_text(encoding='utf-8') if sidecar_path.exists() else ""
+    hooks_already_present = usage_lines and usage_lines[0] in sidecar_content
+
+    if usage_lines and not hooks_already_present:
+        new_code = f"\n# Added by PAIN: {lib_name}\n" + "\n".join(usage_lines) + "\n"
+        with sidecar_path.open("a", encoding='utf-8') as f:
+            f.write(new_code)
+
+    # Always print a clear summary of what was done, even for header-only
+    # libraries that produce no CMake hooks, so the command never looks like a no-op
+    manifest_msg = f"added to vcpkg.json" if added_to_manifest else "already in vcpkg.json"
+
+    if not usage_lines:
+        print(f"  {STATUS_OK} '{lib_name}' linked ({manifest_msg}).")
+        print(f"  {STATUS_INFO} No CMake hooks needed — this appears to be a header-only library.")
+    elif hooks_already_present:
+        print(f"  {STATUS_OK} '{lib_name}' linked ({manifest_msg}).")
+        print(f"  {STATUS_INFO} CMake hooks already present in .pain_deps.cmake.")
+    else:
+        print(f"  {STATUS_OK} '{lib_name}' linked ({manifest_msg}).")
+        print(f"  {STATUS_OK} CMake hooks written to .pain_deps.cmake.")
 
 
 # UI
@@ -461,7 +620,7 @@ def print_logo() -> None:
 | $$      | $$  | $$ /$$$$$$| $$ \  $$
 |__/      |__/  |__/|______/|__/  \__/
 """
-    
+
     subtitle = "Because setting up C++ projects shouldn't hurt this much!"
 
     print(f"{C_RED}{logo}{C_RESET}")
@@ -479,7 +638,8 @@ def print_help() -> None:
     print(f"  {C_YELLOW}adopt{C_RESET}           Make an existing CMake project PAIN-compatible\n")
 
     print(f"{C_RED}DEPENDENCIES{C_RESET}")
-    print(f"  {C_YELLOW}add{C_RESET} <lib>       Add a library")
+    print(f"  {C_YELLOW}install{C_RESET} <lib>   Download and compile a library globally")
+    print(f"  {C_YELLOW}add{C_RESET} <lib>       Link an installed library to your project")
     print(f"  {C_YELLOW}remove{C_RESET} <lib>    Remove a library")
     print(f"  {C_YELLOW}search{C_RESET} <lib>    Search available packages")
     print(f"  {C_YELLOW}list{C_RESET}            List installed dependencies")
@@ -528,7 +688,17 @@ if __name__ == "__main__":
                 fatal("Please provide a library to search for. Example: pain search fmt")
             run_search(sys.argv[2])
 
-        elif cmd in ["add", "remove", "list", "sync", "build", "run", "clean"]:
+        elif cmd == "install":
+            if len(sys.argv) < 3:
+                fatal("Please provide a library to install. Example: pain install fmt")
+            run_install(sys.argv[2])
+
+        elif cmd == "add":
+            if len(sys.argv) < 3:
+                fatal("Please provide a library to add. Example: pain add fmt")
+            run_add(sys.argv[2])
+
+        elif cmd in ["remove", "list", "sync", "build", "run", "clean"]:
             print(f"\n{STATUS_INFO} Command '{cmd}' is not available in this version.\n")
 
         else:
