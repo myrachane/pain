@@ -421,6 +421,50 @@ def _synthesize_cmake_hooks_from_config(lib_name: str, triplet: Optional[str]) -
     ]
 
 
+def _robust_rmtree(path: Path, max_retries: int = 5, retry_delay: float = 0.5) -> bool:
+    """
+    Attempt to remove a directory tree with retries for file locking issues.
+    On Windows, uses PowerShell's Remove-Item which is more aggressive with locked files.
+    On Unix, uses standard shutil.rmtree. Returns True if successful.
+    """
+    if not path.exists():
+        return True
+    
+    for attempt in range(max_retries):
+        try:
+            if os.name == 'nt':
+                # Using PowerShell for windows, Powershell handles locked files better than Python's shutil
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", 
+                     f"Remove-Item -Path '{path}' -Recurse -Force -ErrorAction Stop"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    return True
+                # If PowerShell fails, the error will be in stderr
+                if "Access is denied" in result.stderr or "locked" in result.stderr.lower():
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)
+                        print(f"  {STATUS_INFO} Files locked, retrying in {wait_time:.1f}s... (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+                        continue
+                raise OSError(f"PowerShell removal failed: {result.stderr}")
+            else:
+                # Using standard shutil for UNIX
+                shutil.rmtree(path, ignore_errors=False)
+                return True
+                
+        except (OSError, subprocess.TimeoutExpired) as e:
+            if attempt < max_retries - 1 and "Access is denied" in str(e):
+                wait_time = retry_delay * (attempt + 1)
+                print(f"  {STATUS_INFO} Files locked, retrying in {wait_time:.1f}s... (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            raise
+    return False
+
 # RUNNERS
 
 def run_init(name: str) -> None:
@@ -552,7 +596,10 @@ def run_doctor() -> None:
 
             try:
                 if GLOBAL_VCPKG_PATH.exists():
-                    shutil.rmtree(GLOBAL_VCPKG_PATH, ignore_errors=True)
+                    try:
+                        _robust_rmtree(GLOBAL_VCPKG_PATH)
+                    except OSError as e:
+                        fatal(f"Could not remove old vcpkg installation. Please manually delete:\n{GLOBAL_VCPKG_PATH}\n\nError: {e}")
 
                 subprocess.run(
                     ["git", "clone", "https://github.com/microsoft/vcpkg.git", str(GLOBAL_VCPKG_PATH)],
@@ -567,7 +614,10 @@ def run_doctor() -> None:
 
             except Exception as e:
                 if GLOBAL_VCPKG_PATH.exists():
-                    shutil.rmtree(GLOBAL_VCPKG_PATH, ignore_errors=True)
+                    try:
+                        _robust_rmtree(GLOBAL_VCPKG_PATH)
+                    except OSError:
+                        print(f"  {STATUS_INFO} Warning: Could not remove partial installation at {GLOBAL_VCPKG_PATH}")
                 fatal(f"Failed to install vcpkg. Partial installation removed.\nDetails: {e}")
         else:
             print(f"  {STATUS_INFO} vcpkg installation skipped.")
