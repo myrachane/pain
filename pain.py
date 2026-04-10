@@ -7,6 +7,7 @@ import shutil
 import threading
 import time
 import platform
+import stat
 from pathlib import Path
 from typing import NoReturn, Optional, Tuple
 
@@ -345,23 +346,9 @@ def _extract_cmake_usage_lines(vcpkg_output: str, lib_name: str) -> list:
 # I was running into issues when finally building my test projects so I had to resort to clanker help and
 # this function is what claude gave me. I have kept it exaclty as claude gave me so have fun reading it I guess
 def _synthesize_cmake_hooks_from_config(lib_name: str, triplet: Optional[str]) -> list:
-    """
-    Last-resort fallback for packages that ship no 'usage' file (common with
-    MinGW triplets). Reads the <lib>-config.cmake file directly from the package
-    share directory and synthesises the two CMake lines PAIN needs:
+    """Last-resort fallback for packages that ship no 'usage' file
+    Reads the <lib>-config.cmake file directly to synthesise the CMake lines."""
 
-        find_package(<Pkg> CONFIG REQUIRED)
-        target_link_libraries(${PROJECT_NAME} PRIVATE <Pkg>::<Pkg>)
-
-    Strategy:
-      1. Find the package dir under ~/.pain/vcpkg/packages/<lib_name>_<triplet>
-      2. Scan share/<lib_name>/ for a *-config.cmake or *-targets.cmake file
-      3. Extract INTERFACE_LINK_LIBRARIES or add_library(... IMPORTED) target
-         names to determine the canonical CMake target (e.g. fmt::fmt).
-      4. If we can't determine the target, fall back to the conventional
-         <PascalCase>::<PascalCase> target name derived from the lib name,
-         which is correct for the vast majority of vcpkg ports.
-    """
     packages_dir = GLOBAL_VCPKG_PATH / "packages"
 
     # Find the package directory — prefer exact triplet match, then any triplet
@@ -371,18 +358,13 @@ def _synthesize_cmake_hooks_from_config(lib_name: str, triplet: Optional[str]) -
     # Exclude debug-only dirs
     candidates = [c for c in candidates if c.is_dir() and "debug" not in c.name]
 
-    if not candidates:
-        return []
+    if not candidates: return []
 
     share_dir = candidates[0] / "share" / lib_name
-    if not share_dir.is_dir():
-        return []
-
+    if not share_dir.is_dir(): return []
     # Collect all cmake files in the share dir
     cmake_files = list(share_dir.glob("*.cmake"))
-    if not cmake_files:
-        return []
-
+    if not cmake_files: return []
     # Try to extract imported target names from the cmake files.
     # vcpkg targets are declared with add_library(Foo::Bar IMPORTED) or
     # set_target_properties(Foo::Bar ...) patterns.
@@ -422,48 +404,74 @@ def _synthesize_cmake_hooks_from_config(lib_name: str, triplet: Optional[str]) -
 
 
 def _robust_rmtree(path: Path, max_retries: int = 5, retry_delay: float = 0.5) -> bool:
-    """
-    Attempt to remove a directory tree with retries for file locking issues.
-    On Windows, uses PowerShell's Remove-Item which is more aggressive with locked files.
-    On Unix, uses standard shutil.rmtree. Returns True if successful.
-    """
+    # Walks the directory tree bottom-up to delete files and folders individually
+    # Updates the Throbber dynamically with the currently deleting file
+
     if not path.exists():
         return True
-    
-    for attempt in range(max_retries):
-        try:
-            if os.name == 'nt':
-                # Using PowerShell for windows, Powershell handles locked files better than Python's shutil
-                result = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", 
-                     f"Remove-Item -Path '{path}' -Recurse -Force -ErrorAction Stop"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if result.returncode == 0:
-                    return True
-                # If PowerShell fails, the error will be in stderr
-                if "Access is denied" in result.stderr or "locked" in result.stderr.lower():
-                    if attempt < max_retries - 1:
-                        wait_time = retry_delay * (attempt + 1)
-                        print(f"  {STATUS_INFO} Files locked, retrying in {wait_time:.1f}s... (attempt {attempt + 1}/{max_retries})")
-                        time.sleep(wait_time)
-                        continue
-                raise OSError(f"PowerShell removal failed: {result.stderr}")
-            else:
-                # Using standard shutil for UNIX
-                shutil.rmtree(path, ignore_errors=False)
-                return True
+
+    throbber = Throbber(f"Preparing to delete {path.name}...")
+    throbber.start()
+
+    def _force_delete(target: Path, is_dir: bool = False):
+
+        for attempt in range(max_retries):
+            try:
+                if is_dir:
+                    target.rmdir()
+                else:
+                    # Windows read-only file trap: force write permissions before unlinking
+                    target.chmod(stat.S_IWRITE)
+                    target.unlink()
+                return
+            
+            except OSError as e:
+
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
                 
-        except (OSError, subprocess.TimeoutExpired) as e:
-            if attempt < max_retries - 1 and "Access is denied" in str(e):
-                wait_time = retry_delay * (attempt + 1)
-                print(f"  {STATUS_INFO} Files locked, retrying in {wait_time:.1f}s... (attempt {attempt + 1}/{max_retries})")
-                time.sleep(wait_time)
-                continue
-            raise
-    return False
+                if os.name == 'nt':
+                    cmd = f"Remove-Item -Path '{target}' -Recurse -Force -ErrorAction Stop"
+                    result = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", cmd],
+                        capture_output=True, text=True
+                    )
+                    if result.returncode == 0:
+                        return
+                    raise OSError(f"PowerShell force-remove failed for {target}: {result.stderr}")
+                else:
+                    raise e
+    try:
+        # Bottom-up walk is required so directories are empty before we try to rmdir them
+        for root, dirs, files in os.walk(path, topdown=False):
+            root_path = Path(root)
+            
+            for file in files:
+                file_path = root_path / file
+                # Dynamically update the Throbber text. Truncate name so it doesn't line-wrap and break the UI.
+                short_name = file_path.name if len(file_path.name) < 45 else file_path.name[:42] + "..."
+                throbber.message = f"Deleting: {short_name}"
+                
+                _force_delete(file_path)
+
+            for dir_name in dirs:
+                dir_path = root_path / dir_name
+                throbber.message = f"Removing folder: {dir_path.name}"
+                _force_delete(dir_path, is_dir=True)
+
+        throbber.message = f"Vaporizing base directory..."
+        _force_delete(path, is_dir=True)
+        return True
+
+    except Exception as e:
+        # Safely halt the throbber before printing the error so the terminal stays clean
+        throbber.stop()
+        print(f"  {STATUS_FAIL} Purge halted. Error: {e}")
+        return False
+    finally:
+        if throbber.running:
+            throbber.stop()
 
 # RUNNERS
 
@@ -606,8 +614,12 @@ def run_doctor() -> None:
                     check=True
                 )
 
-                bootstrap_script = "bootstrap-vcpkg.bat" if os.name == 'nt' else "./bootstrap-vcpkg.sh"
-                subprocess.run([bootstrap_script, "-disableMetrics"], cwd=GLOBAL_VCPKG_PATH, check=True)
+                if os.name == 'nt':
+                    bat_path = str(GLOBAL_VCPKG_PATH / "bootstrap-vcpkg.bat")
+                    subprocess.run(f'"{bat_path}" -disableMetrics', cwd=GLOBAL_VCPKG_PATH, shell=True, check=True)
+                else:
+                    sh_path = str(GLOBAL_VCPKG_PATH / "bootstrap-vcpkg.sh")
+                    subprocess.run([sh_path, "-disableMetrics"], cwd=GLOBAL_VCPKG_PATH, check=True)
 
                 print(f"  {STATUS_OK} vcpkg installed successfully!")
                 setup_global_paths(triplet)
@@ -627,6 +639,24 @@ def run_doctor() -> None:
     print(f"\n{STATUS_OK} PAIN diagnostics completed.\n")
 
 
+def run_purge() -> None:
+    # Delete the entire vcpkg global folder
+    print(f"\n{STATUS_INFO} Purging the global vcpkg installation...")
+    
+    if GLOBAL_VCPKG_PATH.exists():
+        try:
+            success = _robust_rmtree(GLOBAL_VCPKG_PATH)
+            if success:
+                print(f"  {STATUS_OK} Successfully removed vcpkg from {GLOBAL_VCPKG_PATH}.")
+                print(f"  {C_YELLOW}Run 'pain doctor' to cleanly reinstall the toolchain.{C_RESET}")
+            else:
+                fatal(f"Could not completely remove {GLOBAL_VCPKG_PATH}. Files might be open in another program.")
+        except Exception as e:
+            fatal(f"Error while purging vcpkg: {e}")
+    else:
+        print(f"  {STATUS_INFO} vcpkg is not installed. Nothing to purge.")
+
+
 def run_search(query: str) -> None:
     print(f"\n{STATUS_INFO} Searching vcpkg registry for '{query}'...\n")
 
@@ -640,9 +670,7 @@ def run_search(query: str) -> None:
     try:
         result = subprocess.run(
             [str(vcpkg_exe), "search", query],
-            capture_output=True,
-            text=True,
-            cwd=GLOBAL_VCPKG_PATH
+            capture_output=True, text=True, cwd=GLOBAL_VCPKG_PATH
         )
         throbber.stop()
     except Exception as e:
@@ -1136,7 +1164,8 @@ def print_help() -> None:
     print(f"  {C_YELLOW}clean{C_RESET}           Clean build directory\n")
 
     print(f"{C_RED}SYSTEM{C_RESET}")
-    print(f"  {C_YELLOW}doctor{C_RESET}          Run diagnostics and configure environment\n")
+    print(f"  {C_YELLOW}doctor{C_RESET}          Run diagnostics and configure environment")
+    print(f"  {C_YELLOW}purge{C_RESET}           Completely remove and reset the vcpkg toolchain\n")
 
 
 def dashboard() -> None:
@@ -1175,6 +1204,9 @@ if __name__ == "__main__":
 
         elif cmd == "doctor":
             run_doctor()
+
+        elif cmd == "purge":
+            run_purge()
 
         elif cmd == "search":
             if len(sys.argv) < 3:
