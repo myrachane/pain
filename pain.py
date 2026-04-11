@@ -791,18 +791,16 @@ def run_add(lib_name: str) -> None:
 
     print(f"\n{STATUS_INFO} Linking '{lib_name}' to your project...")
 
+    # Load the manifest early, but DO NOT write to it yet
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    needs_manifest_update = lib_name not in manifest.get("dependencies", [])
+
     throbber = Throbber("Extracting CMake hooks...")
     throbber.start()
 
+    usage_lines = []
+
     try:
-
-        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-        added_to_manifest = False
-        if lib_name not in manifest.get("dependencies", []):
-            manifest.setdefault("dependencies", []).append(lib_name)
-            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding='utf-8')
-            added_to_manifest = True
-
         # Run vcpkg install to get the usage output. The library is already cached
         # so this completes instantly — it's used only to capture the usage block.
         result = subprocess.run(
@@ -841,24 +839,39 @@ def run_add(lib_name: str) -> None:
             _, triplet = detect_best_compiler()
             usage_lines = _synthesize_cmake_hooks_from_config(lib_name, triplet)
 
-        throbber.stop()
+    except Exception as e:
+        # If anything above fails, we exit here. The manifest is never written.
+        fatal(f"An error occurred while extracting hooks for {lib_name}:\n{e}")
+        
+    finally:
+        # Use a consistent stop path, always call stop() in finally so the
+        # throbber is cleaned up whether we succeed, fail, or hit an exception
+        if throbber.running:
+            throbber.stop()
 
+    # We only reach this point if hook extraction completed without exceptions
+    try:
         if usage_lines:
             sidecar_content = sidecar_path.read_text(encoding='utf-8') if sidecar_path.exists() else ""
             if usage_lines[0] not in sidecar_content:
                 with sidecar_path.open("a", encoding='utf-8') as f:
                     f.write(f"\n# Added by PAIN: {lib_name}\n" + "\n".join(usage_lines) + "\n")
 
-            manifest_msg = "added to vcpkg.json" if added_to_manifest else "already in vcpkg.json"
+        added_to_manifest = False
+        if needs_manifest_update:
+            manifest.setdefault("dependencies", []).append(lib_name)
+            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding='utf-8')
+            added_to_manifest = True
+
+        manifest_msg = "added to vcpkg.json" if added_to_manifest else "already in vcpkg.json"
+        
+        if usage_lines:
             print(f"  {STATUS_OK} '{lib_name}' linked ({manifest_msg}).")
         else:
             print(f"  {STATUS_INFO} '{lib_name}' linked to manifest, but no CMake hooks were found.")
 
     except Exception as e:
-        # Use a consistent stop path — always call stop() in finally so the
-        # throbber is cleaned up whether we succeed, fail, or hit an exception
-        throbber.stop()
-        fatal(f"An error occurred while linking {lib_name}:\n{e}")
+        fatal(f"An error occurred while updating project files:\n{e}")
 
 
 def run_remove(lib_name: str) -> None:
@@ -914,10 +927,10 @@ def run_sync() -> None:
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     deps = manifest.get("dependencies", [])
 
-    if sidecar_path.exists():
-        sidecar_path.unlink()
-
+    # If the manifest is entirely empty, it is safe to delete the sidecar
     if not deps:
+        if sidecar_path.exists():
+            sidecar_path.unlink()
         print(f"  {STATUS_OK} No dependencies in manifest. Sidecar cleared.")
         return
 
@@ -926,28 +939,63 @@ def run_sync() -> None:
 
     success_count = 0
     failures = []
+    new_sidecar_content = ""
 
     # Wrap the entire loop in try/finally so the throbber is always stopped
     try:
+        _, triplet = detect_best_compiler()
+
         for lib in deps:
             result = subprocess.run(
                 [str(vcpkg_exe), "install", lib],
                 capture_output=True, text=True, cwd=GLOBAL_VCPKG_PATH
             )
-            if result.returncode == 0:
-                usage_lines = _extract_cmake_usage_lines(result.stdout, lib)
-                if usage_lines:
-                    new_code = f"\n# Added by PAIN: {lib}\n" + "\n".join(usage_lines) + "\n"
-                    with sidecar_path.open("a", encoding='utf-8') as f:
-                        f.write(new_code)
+            
+            if result.returncode != 0:
+                failures.append(lib)
+                continue
+
+            # Fallback 1: stdout
+            usage_lines = _extract_cmake_usage_lines(result.stdout, lib)
+
+            # Fallback 2: Static usage file
+            if not usage_lines:
+                packages_dir = GLOBAL_VCPKG_PATH / "packages"
+                candidates = list(packages_dir.glob(f"{lib}_{triplet}")) if triplet else []
+                if not candidates:
+                    candidates = list(packages_dir.glob(f"{lib}_*"))
+                candidates = [c for c in candidates if c.is_dir() and "debug" not in c.name]
+
+                for candidate in candidates:
+                    usage_file = candidate / "share" / lib / "usage"
+                    if usage_file.exists():
+                        usage_lines = _extract_cmake_usage_lines(
+                            usage_file.read_text(encoding='utf-8'), lib
+                        )
+                        if usage_lines:
+                            break
+
+            # Fallback 3: Synthesise from config
+            if not usage_lines:
+                usage_lines = _synthesize_cmake_hooks_from_config(lib, triplet)
+
+            # Increment if usage_lines were actually found
+            if usage_lines:
+                new_sidecar_content += f"\n# Added by PAIN: {lib}\n" + "\n".join(usage_lines) + "\n"
                 success_count += 1
             else:
                 failures.append(lib)
+
     finally:
         throbber.stop()
 
+    # Only overwrite the existing sidecar if we actually generated valid hooks
+    if new_sidecar_content:
+        sidecar_path.write_text(new_sidecar_content, encoding='utf-8')
+
     for lib in failures:
-        print(f"  {STATUS_FAIL} Failed to retrieve hooks for '{lib}', skipping.")
+        print(f"  {STATUS_FAIL} Failed to retrieve hooks for '{lib}'.")
+        
     print(f"  {STATUS_OK} Sync complete! Restored hooks for {success_count} of {len(deps)} libraries.")
 
 
@@ -1109,8 +1157,11 @@ def run_clean() -> None:
     build_dir = Path.cwd() / "build"
     if build_dir.exists():
         print(f"\n{STATUS_INFO} Cleaning build directory...")
-        shutil.rmtree(build_dir, ignore_errors=True)
-        print(f"  {STATUS_OK} Build folder successfully removed.")
+        success = _robust_rmtree(build_dir)
+        if success:
+            print(f"  {STATUS_OK} Build folder successfully removed.")
+        else:
+            fatal("Could not completely remove the build directory. Files might be open in your IDE or another program.")
     else:
         print(f"\n{STATUS_INFO} Build directory does not exist. Nothing to clean.")
 
