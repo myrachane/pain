@@ -83,7 +83,7 @@ You can compile it into a native binary for your system using [PyInstaller](http
 3. Move the binary to your PATH:
    ```bash
    # Move the resulting binary from the 'dist' folder
-   sudo mv dist/pain/usr/local/bin/
+   sudo mv dist/pain /usr/local/bin/
    ```
 
 ## Quick Start
