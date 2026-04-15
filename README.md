@@ -129,9 +129,3 @@ This project is licensed under the **GPL-3.0 License**.
 > 
 > PAIN repository: https://github.com/omnimistic/pain/  
 > Original author (me): [@omnimistic](https://github.com/omnimistic)
-
----
-
-<p align="center">
-  $\color{#D30000}{\large \textsf{Built with pure, unadulterated hatred for C++ linker errors.}}$
-</p>
