@@ -343,15 +343,14 @@ def _extract_cmake_usage_lines(vcpkg_output: str, lib_name: str) -> list:
     return usage_lines
 
 
-# I was running into issues when finally building my test projects so I had to resort to clanker help and
-# this function is what claude gave me. I have kept it exaclty as claude gave me so have fun reading it I guess
+# This function was written with the help ai but then it was manually modified to fix some obvious issues that were overlooked
 def _synthesize_cmake_hooks_from_config(lib_name: str, triplet: Optional[str]) -> list:
     """Last-resort fallback for packages that ship no 'usage' file
     Reads the <lib>-config.cmake file directly to synthesise the CMake lines."""
 
     packages_dir = GLOBAL_VCPKG_PATH / "packages"
 
-    # Find the package directory — prefer exact triplet match, then any triplet
+    # Find the package directory
     candidates = list(packages_dir.glob(f"{lib_name}_{triplet}")) if triplet else []
     if not candidates:
         candidates = list(packages_dir.glob(f"{lib_name}_*"))
@@ -362,9 +361,11 @@ def _synthesize_cmake_hooks_from_config(lib_name: str, triplet: Optional[str]) -
 
     share_dir = candidates[0] / "share" / lib_name
     if not share_dir.is_dir(): return []
+    
     # Collect all cmake files in the share dir
     cmake_files = list(share_dir.glob("*.cmake"))
     if not cmake_files: return []
+    
     # Try to extract imported target names from the cmake files.
     # vcpkg targets are declared with add_library(Foo::Bar IMPORTED) or
     # set_target_properties(Foo::Bar ...) patterns.
@@ -388,18 +389,18 @@ def _synthesize_cmake_hooks_from_config(lib_name: str, triplet: Optional[str]) -
             continue
 
     if target_names:
-        # Use the first (most likely primary) target for the link line,
-        # but emit find_package based on the namespace prefix (part before ::)
-        primary_target = target_names[0]
-        package_name = primary_target.split("::")[0]
+        # Extract the package namespace (e.g., 'ftxui' from 'ftxui::screen')
+        package_name = target_names[0].split("::")[0]
+        # Combine ALL found targets into a single space-separated string
+        all_targets = " ".join(target_names)
     else:
         # Conventional fallback: fmt -> fmt::fmt
         package_name = lib_name
-        primary_target = f"{lib_name}::{lib_name}"
+        all_targets = f"{lib_name}::{lib_name}"
 
     return [
         f"find_package({package_name} CONFIG REQUIRED)",
-        f"target_link_libraries(${{PROJECT_NAME}} PRIVATE {primary_target})",
+        f"target_link_libraries(${{PROJECT_NAME}} PRIVATE {all_targets})",
     ]
 
 
