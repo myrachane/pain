@@ -343,17 +343,22 @@ def _extract_cmake_usage_lines(vcpkg_output: str, lib_name: str) -> list:
     return usage_lines
 
 
-# This function was written with the help ai but then it was manually modified to fix some obvious issues that were overlooked
+# This function was written with the help ai but then it was heavily modified
 def _synthesize_cmake_hooks_from_config(lib_name: str, triplet: Optional[str]) -> list:
-    """Last-resort fallback for packages that ship no 'usage' file
-    Reads the <lib>-config.cmake file directly to synthesise the CMake lines."""
-
+    """
+    Last-resort fallback for packages that ship no 'usage' file.
+    Synthesizes CMake hooks by parsing package config files directly.
+    Handles libraries that do not ship a standard 'usage' file.
+    Dynamically extracts and links all discovered targets.
+    """
+    
     packages_dir = GLOBAL_VCPKG_PATH / "packages"
 
     # Find the package directory
     candidates = list(packages_dir.glob(f"{lib_name}_{triplet}")) if triplet else []
     if not candidates:
         candidates = list(packages_dir.glob(f"{lib_name}_*"))
+    
     # Exclude debug-only dirs
     candidates = [c for c in candidates if c.is_dir() and "debug" not in c.name]
 
@@ -376,15 +381,18 @@ def _synthesize_cmake_hooks_from_config(lib_name: str, triplet: Optional[str]) -
     for cmake_file in cmake_files:
         try:
             text = cmake_file.read_text(encoding='utf-8', errors='ignore')
+            
+            # 1. Scan for IMPORTED targets
             for m in imported_pattern.finditer(text):
                 name = m.group(1)
                 if '::' in name and name not in target_names:
                     target_names.append(name)
-            if not target_names:
-                for m in property_pattern.finditer(text):
-                    name = m.group(1)
-                    if '::' in name and name not in target_names:
-                        target_names.append(name)
+                    
+            # 2. Scan for PROPERTIES targets
+            for m in property_pattern.finditer(text):
+                name = m.group(1)
+                if '::' in name and name not in target_names:
+                    target_names.append(name)
         except Exception:
             continue
 
