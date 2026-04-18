@@ -511,7 +511,9 @@ def run_init(name: str) -> None:
         f"project({name})\n\n"
         "set(CMAKE_CXX_STANDARD 20)\n"
         "set(CMAKE_CXX_STANDARD_REQUIRED ON)\n\n"
-        f"add_executable({name} src/main.cpp)\n\n"
+        "# Auto-discover all source files in the src/ directory\n"
+        'file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp" "src/*.c")\n\n'
+        f"add_executable({name} ${{SOURCES}})\n\n"
         f"{PAIN_HOOK_BLOCK}\n"
     )
     (root / "CMakeLists.txt").write_text(cmake_content, encoding='utf-8')
